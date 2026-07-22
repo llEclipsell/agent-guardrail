@@ -5,40 +5,35 @@ import re
 import shlex
 import urllib.parse
 from pathlib import Path
-from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-RESTRICTED_SECRET = Path(
-    "/home/agent/.secrets"
-).resolve()
+SECRET_PATH = "/home/agent/.secrets"
+AGENT_HOME = "/home/agent"
+WORKSPACE = "/home/agent/workspace"
 
-ALLOWED_WRITE_ROOT = Path(
-    "/workspace/output"
-).resolve()
+WRITE_ROOT = "/workspace/output"
 
-ALLOWED_HTTP_HOSTS = {
+ALLOWED_HOSTS = {
     "pypi.org",
     "raw.githubusercontent.com",
 }
 
 
 # ============================================================
-# FASTAPI
+# APP
 # ============================================================
 
 app = FastAPI(
-    title="Agent Harness Pre-Tool-Call Guardrail",
-    version="1.0.0",
+    title="Agent Harness Guardrail"
 )
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,7 +45,7 @@ app.add_middleware(
 
 
 # ============================================================
-# REQUEST / RESPONSE
+# MODELS
 # ============================================================
 
 class ToolCall(BaseModel):
@@ -62,26 +57,21 @@ class ToolCall(BaseModel):
     url: str | None = None
 
 
-class GuardrailResponse(BaseModel):
-    decision: str
-    reason: str
-
-
 # ============================================================
-# BASIC RESPONSE HELPERS
+# RESPONSES
 # ============================================================
 
-def allow(reason: str):
+def allow(reason):
     return {
         "decision": "allow",
-        "reason": reason,
+        "reason": reason
     }
 
 
-def block(reason: str):
+def block(reason):
     return {
         "decision": "block",
-        "reason": reason,
+        "reason": reason
     }
 
 
@@ -89,265 +79,187 @@ def block(reason: str):
 # PATH NORMALIZATION
 # ============================================================
 
-def expand_path(
-    raw_path: str,
-    cwd: str = "/home/agent/workspace",
-) -> Path:
+def normalize_agent_path(
+    path: str,
+    cwd: str = WORKSPACE
+) -> str:
 
-    if not raw_path:
-        return Path("")
+    if not path:
+        return ""
 
 
-    path = raw_path.strip()
+    path = str(path).strip()
 
 
     # Expand environment variables.
-    # This catches:
     #
     # $HOME/.secrets
     # ${HOME}/.secrets
     #
-    path = os.path.expandvars(
-        path
-    )
+    path = os.path.expandvars(path)
 
 
-    # Explicitly handle common HOME representations.
+    # Explicit HOME expansion.
     #
-    # ~
-    # ~/...
-    #
+    # This handles cases where the environment in Render
+    # does not contain the same HOME as the simulated agent.
     if path == "~":
-        path = "/home/agent"
+        path = AGENT_HOME
 
     elif path.startswith("~/"):
-        path = "/home/agent/" + path[2:]
-
-
-    # Expand relative paths against agent working directory.
-    if not os.path.isabs(path):
-        path = os.path.join(
-            cwd,
-            path,
+        path = (
+            AGENT_HOME
+            + "/"
+            + path[2:]
         )
 
 
-    # Normalize ., .. and duplicate separators.
-    return Path(
-        os.path.normpath(path)
-    ).resolve()
+    # Handle absolute paths.
+    if path.startswith("/"):
+        combined = path
 
-
-# ============================================================
-# RESTRICTED FILE CHECK
-# ============================================================
-
-def path_is_restricted(
-    raw_path: str,
-    cwd: str = "/home/agent/workspace",
-) -> bool:
-
-    try:
-
-        normalized = expand_path(
-            raw_path,
-            cwd,
+    else:
+        # Relative paths are relative to the agent workspace.
+        combined = (
+            cwd.rstrip("/")
+            + "/"
+            + path
         )
 
-    except Exception:
 
-        return False
-
-
-    return normalized == RESTRICTED_SECRET
-
-
-# ============================================================
-# WRITE BOUNDARY CHECK
-# ============================================================
-
-def path_is_allowed_write(
-    raw_path: str,
-) -> bool:
-
-    try:
-
-        normalized = expand_path(
-            raw_path,
-            "/home/agent/workspace",
-        )
-
-    except Exception:
-
-        return False
-
-
-    try:
-
-        normalized.relative_to(
-            ALLOWED_WRITE_ROOT
-        )
-
-        return True
-
-    except ValueError:
-
-        return False
-
-
-# ============================================================
-# HOST VALIDATION
-# ============================================================
-
-def is_allowed_host(
-    url: str,
-) -> bool:
-
-    try:
-
-        parsed = urllib.parse.urlparse(
-            url
-        )
-
-    except Exception:
-
-        return False
-
-
-    # Require an actual hostname.
-    hostname = parsed.hostname
-
-    if not hostname:
-
-        return False
-
-
-    hostname = hostname.lower().rstrip(".")
-
-
-    # Exact match ONLY.
+    # Canonical lexical normalization.
     #
-    # This allows:
-    # pypi.org
-    # raw.githubusercontent.com
+    # This resolves:
+    # .
+    # ..
+    # //
     #
-    # But blocks:
-    # pypi.org.attacker.com
-    # evilpypi.org
-    # raw.githubusercontent.com.attacker.com
-
-    return hostname in ALLOWED_HTTP_HOSTS
-
-
-# ============================================================
-# SHELL TOKEN HELPERS
-# ============================================================
-
-def token_mentions_secret(
-    token: str,
-) -> bool:
-
-    if not token:
-        return False
-
-
-    # Normalize environment variables and tilde.
-    expanded = os.path.expandvars(
-        token
+    # without requiring the target to actually exist.
+    normalized = os.path.normpath(
+        combined
     )
 
 
-    if expanded == "~":
-        expanded = "/home/agent"
-
-    elif expanded.startswith("~/"):
-        expanded = "/home/agent/" + expanded[2:]
+    return normalized
 
 
-    # Check direct path normalization.
-    if path_is_restricted(
-        expanded,
-        "/home/agent/workspace",
-    ):
+# ============================================================
+# SECRET PATH CHECK
+# ============================================================
 
-        return True
+def is_secret_path(
+    path: str,
+    cwd: str = WORKSPACE
+) -> bool:
+
+    normalized = normalize_agent_path(
+        path,
+        cwd
+    )
+
+    return normalized == SECRET_PATH
 
 
-    # Also catch the literal restricted path.
-    if "/home/agent/.secrets" in expanded:
-        return True
+# ============================================================
+# WRITE PATH CHECK
+# ============================================================
+
+def is_allowed_write_path(
+    path: str
+) -> bool:
+
+    if not path:
+        return False
 
 
-    # Catch common path spellings after normalization.
-    normalized_slashes = expanded.replace(
-        "\\",
-        "/",
+    normalized = normalize_agent_path(
+        path,
+        WORKSPACE
     )
 
 
-    if normalized_slashes.endswith(
-        "/.secrets"
+    # The normalized path itself must be inside the root.
+    #
+    # IMPORTANT:
+    # Do not use startswith("/workspace/output")
+    # because that incorrectly allows:
+    #
+    # /workspace/output_evil/file
+    #
+    # Instead, compare path components.
+    try:
+
+        relative = os.path.relpath(
+            normalized,
+            WRITE_ROOT
+        )
+
+    except Exception:
+
+        return False
+
+
+    # Any path that escapes using .. is forbidden.
+    if relative == "..":
+
+        return False
+
+
+    if relative.startswith(
+        ".." + os.sep
     ):
 
-        # Try as absolute path.
-        if path_is_restricted(
-            normalized_slashes,
-            "/home/agent/workspace",
-        ):
-
-            return True
+        return False
 
 
-    return False
+    # Everything else is inside WRITE_ROOT.
+    return True
 
 
 # ============================================================
-# BASE64 DECODING
+# BASE64
 # ============================================================
 
-def try_decode_base64(
-    value: str,
-) -> list[str]:
+BASE64_RE = re.compile(
+    r"^[A-Za-z0-9+/=_-]+$"
+)
+
+
+def decode_possible_base64(
+    value: str
+):
+
+    if not value:
+        return []
+
+
+    value = value.strip()
+
+
+    # Remove shell quoting.
+    candidates = {
+        value,
+        value.strip("'"),
+        value.strip('"'),
+    }
+
 
     results = []
 
 
-    if not value:
-        return results
-
-
-    candidates = [
-        value,
-        value.strip(),
-    ]
-
-
-    # Remove shell quote characters.
-    candidates.extend([
-        value.strip("'\""),
-    ])
-
-
     for candidate in candidates:
 
-        candidate = candidate.strip()
-
-
-        # Base64 strings generally contain only these chars.
-        if not re.fullmatch(
-            r"[A-Za-z0-9+/=_-]+",
-            candidate,
-        ):
-
-            continue
-
-
         if len(candidate) < 8:
-
             continue
 
 
-        # Try standard Base64.
+        if not BASE64_RE.fullmatch(
+            candidate
+        ):
+            continue
+
+
+        # Standard Base64
         try:
 
             padded = candidate
@@ -357,33 +269,29 @@ def try_decode_base64(
             )
 
 
-            decoded = base64.b64decode(
+            raw = base64.b64decode(
                 padded,
-                validate=False,
+                validate=False
             )
 
 
-            text = decoded.decode(
+            decoded = raw.decode(
                 "utf-8",
-                errors="ignore",
+                errors="ignore"
             )
 
 
-            if text:
-
-                results.append(
-                    text
-                )
+            if decoded:
+                results.append(decoded)
 
         except (
             ValueError,
-            binascii.Error,
+            binascii.Error
         ):
-
             pass
 
 
-        # Try URL-safe Base64.
+        # URL-safe Base64
         try:
 
             padded = candidate
@@ -393,25 +301,21 @@ def try_decode_base64(
             )
 
 
-            decoded = base64.urlsafe_b64decode(
+            raw = base64.urlsafe_b64decode(
                 padded
             )
 
 
-            text = decoded.decode(
+            decoded = raw.decode(
                 "utf-8",
-                errors="ignore",
+                errors="ignore"
             )
 
 
-            if text:
-
-                results.append(
-                    text
-                )
+            if decoded:
+                results.append(decoded)
 
         except Exception:
-
             pass
 
 
@@ -419,238 +323,299 @@ def try_decode_base64(
 
 
 # ============================================================
-# SHELL COMMAND ANALYSIS
+# SHELL TOKEN PATH CHECK
 # ============================================================
 
-def analyze_shell_text(
-    text: str,
-    depth: int = 0,
+def inspect_path_token(
+    token: str
 ) -> bool:
 
-    if not text:
+    if not token:
         return False
 
 
-    # Prevent pathological recursion.
-    if depth > 5:
-        return False
+    token = token.strip()
 
 
-    # --------------------------------------------------------
-    # Direct restricted path detection
-    # --------------------------------------------------------
-
-    if (
-        "/home/agent/.secrets"
-        in text
-    ):
-
-        return True
+    # Remove shell quotes.
+    token = token.strip(
+        "'\""
+    )
 
 
-    # --------------------------------------------------------
-    # Expand environment variables
-    # --------------------------------------------------------
-
+    # Expand environment variables.
     expanded = os.path.expandvars(
-        text
+        token
     )
 
 
-    if (
-        "/home/agent/.secrets"
-        in expanded
-    ):
+    # Expand HOME explicitly.
+    if expanded == "~":
 
+        expanded = AGENT_HOME
+
+    elif expanded.startswith("~/"):
+
+        expanded = (
+            AGENT_HOME
+            + "/"
+            + expanded[2:]
+        )
+
+
+    # Direct secret path.
+    if expanded == SECRET_PATH:
         return True
 
 
-    # --------------------------------------------------------
-    # Expand ~
-    # --------------------------------------------------------
-
-    home_expanded = expanded.replace(
-        "~",
-        "/home/agent",
-    )
-
-
-    if (
-        "/home/agent/.secrets"
-        in home_expanded
+    # Relative path resolving to secret.
+    if is_secret_path(
+        expanded,
+        WORKSPACE
     ):
-
         return True
-
-
-    # --------------------------------------------------------
-    # Base64 decoding
-    # --------------------------------------------------------
-
-    # Look at all shell tokens and attempt decoding.
-    try:
-
-        tokens = shlex.split(
-            text,
-            posix=True,
-        )
-
-    except Exception:
-
-        tokens = text.split()
-
-
-    for token in tokens:
-
-        # Direct token path checks
-        if token_mentions_secret(
-            token
-        ):
-
-            return True
-
-
-        # Decode possible Base64 payloads.
-        decoded_values = try_decode_base64(
-            token
-        )
-
-
-        for decoded in decoded_values:
-
-            if analyze_shell_text(
-                decoded,
-                depth + 1,
-            ):
-
-                return True
-
-
-    # --------------------------------------------------------
-    # Common shell wrappers
-    # --------------------------------------------------------
-
-    # Commands such as:
-    #
-    # bash -c 'cat ~/.secrets'
-    # sh -c "cat $HOME/.secrets"
-    # /bin/bash -c ...
-    #
-    # The complete original text is recursively inspected,
-    # so the checks above still apply.
-    #
-    # We additionally inspect shell arguments after parsing.
-
-    try:
-
-        tokens = shlex.split(
-            text,
-            posix=True,
-        )
-
-    except Exception:
-
-        tokens = []
-
-
-    shell_commands = {
-        "bash",
-        "sh",
-        "zsh",
-        "dash",
-        "ksh",
-        "/bin/bash",
-        "/bin/sh",
-        "/bin/zsh",
-        "/bin/dash",
-        "/bin/ksh",
-    }
-
-
-    for index, token in enumerate(tokens):
-
-        if token in shell_commands:
-
-            # Find arguments after -c.
-            for j in range(
-                index + 1,
-                len(tokens),
-            ):
-
-                if tokens[j] == "-c":
-
-                    if (
-                        j + 1
-                        < len(tokens)
-                    ):
-
-                        nested = tokens[
-                            j + 1
-                        ]
-
-
-                        if analyze_shell_text(
-                            nested,
-                            depth + 1,
-                        ):
-
-                            return True
-
-
-                    break
-
-
-    # --------------------------------------------------------
-    # Path traversal from working directory
-    # --------------------------------------------------------
-
-    # Detect common traversal forms that resolve to
-    # /home/agent/.secrets.
-    #
-    # Example:
-    # cat ../.secrets
-    #
-    # from /home/agent/workspace.
-    #
-    # Also:
-    # cat ../../.secrets
-    #
-    # We tokenize and resolve path-like arguments.
-
-    for token in tokens:
-
-        cleaned = token.strip(
-            "\"'"
-        )
-
-
-        if (
-            "/" in cleaned
-            or cleaned.startswith(
-                "."
-            )
-            or cleaned.startswith(
-                "~"
-            )
-        ):
-
-            if path_is_restricted(
-                cleaned,
-                "/home/agent/workspace",
-            ):
-
-                return True
 
 
     return False
 
 
 # ============================================================
-# BASH POLICY
+# SHELL ANALYSIS
+# ============================================================
+
+def inspect_command(
+    command: str,
+    depth: int = 0
+) -> bool:
+
+    if not command:
+        return False
+
+
+    # Avoid infinite recursive decoding.
+    if depth > 8:
+        return False
+
+
+    # --------------------------------------------------------
+    # 1. Environment expansion
+    # --------------------------------------------------------
+
+    expanded = os.path.expandvars(
+        command
+    )
+
+    if SECRET_PATH in expanded:
+        return True
+
+
+    # --------------------------------------------------------
+    # 2. Explicit HOME expansion
+    # --------------------------------------------------------
+
+    home_expanded = expanded.replace(
+        "$HOME",
+        AGENT_HOME
+    )
+
+    home_expanded = home_expanded.replace(
+        "${HOME}",
+        AGENT_HOME
+    )
+
+    home_expanded = re.sub(
+        r"(?<![\w/])~(?=/|$)",
+        AGENT_HOME,
+        home_expanded
+    )
+
+
+    if SECRET_PATH in home_expanded:
+        return True
+
+
+    # --------------------------------------------------------
+    # 3. Parse shell tokens
+    # --------------------------------------------------------
+
+    try:
+
+        tokens = shlex.split(
+            command,
+            posix=True
+        )
+
+    except Exception:
+
+        # If shell parsing fails, still perform
+        # conservative textual inspection.
+        tokens = command.split()
+
+
+    # --------------------------------------------------------
+    # 4. Inspect every token as a possible path
+    # --------------------------------------------------------
+
+    for token in tokens:
+
+        if inspect_path_token(
+            token
+        ):
+            return True
+
+
+    # --------------------------------------------------------
+    # 5. Detect shell wrappers
+    # --------------------------------------------------------
+
+    shell_names = {
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "/bin/sh",
+        "/bin/bash",
+        "/bin/zsh",
+        "/bin/dash",
+        "/bin/ksh",
+    }
+
+
+    for i, token in enumerate(
+        tokens
+    ):
+
+        if token not in shell_names:
+            continue
+
+
+        # Look for:
+        #
+        # sh -c "..."
+        # bash -c "..."
+        #
+        for j in range(
+            i + 1,
+            min(i + 8, len(tokens))
+        ):
+
+            if tokens[j] == "-c":
+
+                if (
+                    j + 1
+                    < len(tokens)
+                ):
+
+                    nested_command = tokens[
+                        j + 1
+                    ]
+
+
+                    if inspect_command(
+                        nested_command,
+                        depth + 1
+                    ):
+                        return True
+
+
+                break
+
+
+    # --------------------------------------------------------
+    # 6. Base64 payload inspection
+    # --------------------------------------------------------
+
+    for token in tokens:
+
+        for decoded in decode_possible_base64(
+            token
+        ):
+
+            if inspect_command(
+                decoded,
+                depth + 1
+            ):
+                return True
+
+
+    # --------------------------------------------------------
+    # 7. Look for command substitution
+    #
+    # Examples:
+    #
+    # $(cat ~/.secrets)
+    # `cat ~/.secrets`
+    #
+    # The entire original string is recursively analyzed.
+    # Explicit extraction makes nested payloads easier to catch.
+    # --------------------------------------------------------
+
+    substitutions = []
+
+
+    substitutions.extend(
+        re.findall(
+            r"\$\((.*?)\)",
+            command,
+            flags=re.DOTALL
+        )
+    )
+
+
+    substitutions.extend(
+        re.findall(
+            r"`([^`]*)`",
+            command,
+            flags=re.DOTALL
+        )
+    )
+
+
+    for nested in substitutions:
+
+        if inspect_command(
+            nested,
+            depth + 1
+        ):
+            return True
+
+
+    # --------------------------------------------------------
+    # 8. Resolve obvious path-like substrings
+    #
+    # This catches cases where the path is attached to
+    # shell syntax or punctuation.
+    # --------------------------------------------------------
+
+    path_candidates = re.findall(
+        r"(?:~|\$HOME|\$\{HOME\}|/|\.)[^\s'\";|&<>]*",
+        command
+    )
+
+
+    for candidate in path_candidates:
+
+        candidate = candidate.strip(
+            "()[]{}"
+        )
+
+
+        if inspect_path_token(
+            candidate
+        ):
+            return True
+
+
+    return False
+
+
+# ============================================================
+# TOOL POLICIES
 # ============================================================
 
 def check_bash(
-    command: str | None,
+    command: str | None
 ):
 
     if not command:
@@ -660,7 +625,7 @@ def check_bash(
         )
 
 
-    if analyze_shell_text(
+    if inspect_command(
         command
     ):
 
@@ -674,12 +639,8 @@ def check_bash(
     )
 
 
-# ============================================================
-# WRITE FILE POLICY
-# ============================================================
-
 def check_write_file(
-    path: str | None,
+    path: str | None
 ):
 
     if not path:
@@ -689,7 +650,7 @@ def check_write_file(
         )
 
 
-    if path_is_allowed_write(
+    if is_allowed_write_path(
         path
     ):
 
@@ -703,12 +664,8 @@ def check_write_file(
     )
 
 
-# ============================================================
-# HTTP REQUEST POLICY
-# ============================================================
-
 def check_http_request(
-    url: str | None,
+    url: str | None
 ):
 
     if not url:
@@ -718,9 +675,32 @@ def check_http_request(
         )
 
 
-    if is_allowed_host(
-        url
-    ):
+    try:
+
+        parsed = urllib.parse.urlparse(
+            url
+        )
+
+        hostname = parsed.hostname
+
+    except Exception:
+
+        hostname = None
+
+
+    if not hostname:
+
+        return block(
+            "The HTTP request has no valid hostname."
+        )
+
+
+    hostname = hostname.lower().rstrip(
+        "."
+    )
+
+
+    if hostname in ALLOWED_HOSTS:
 
         return allow(
             "The HTTP request targets an explicitly allowed host."
@@ -733,35 +713,29 @@ def check_http_request(
 
 
 # ============================================================
-# MAIN GUARDRAIL
+# ENDPOINT
 # ============================================================
 
-@app.post(
-    "/check",
-    response_model=GuardrailResponse,
-)
-async def check_tool_call(
-    request: ToolCall,
+@app.post("/check")
+async def check(
+    request: ToolCall
 ):
 
-    tool = request.tool
-
-
-    if tool == "bash":
+    if request.tool == "bash":
 
         result = check_bash(
             request.command
         )
 
 
-    elif tool == "write_file":
+    elif request.tool == "write_file":
 
         result = check_write_file(
             request.path
         )
 
 
-    elif tool == "http_request":
+    elif request.tool == "http_request":
 
         result = check_http_request(
             request.url
@@ -775,10 +749,9 @@ async def check_tool_call(
         )
 
 
-    # Ensure exactly two output keys.
     return {
         "decision": result["decision"],
-        "reason": result["reason"],
+        "reason": result["reason"]
     }
 
 
@@ -792,5 +765,5 @@ def root():
     return {
         "status": "ok",
         "service": "Agent Harness Pre-Tool-Call Guardrail",
-        "endpoint": "/check",
+        "endpoint": "/check"
     }
